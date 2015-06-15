@@ -25,6 +25,8 @@
 #ifndef NANOSVGRAST_H
 #define NANOSVGRAST_H
 
+#include <pmmintrin.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -861,14 +863,106 @@ static unsigned int nsvg__applyOpacity(unsigned int c, float u)
 
 static inline int nsvg__div255(int x)
 {
-    return ((x+1) * 257) >> 16;
+	return ((x + 1) * 257) >> 16;
 }
 
 static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* cover, int x, int y,
 								float tx, float ty, float scale, NSVGcachedPaint* cache)
 {
-
 	if (cache->type == NSVG_PAINT_COLOR) {
+#define NSVG_USESSE2
+#ifdef NSVG_USESSE2
+	int i, cr, cg, cb, ca;
+	cr = cache->colors[0] & 0xff;
+	cg = (cache->colors[0] >> 8) & 0xff;
+	cb = (cache->colors[0] >> 16) & 0xff;
+	ca = (cache->colors[0] >> 24) & 0xff;
+
+	__m128i const0 = _mm_setzero_si128();
+	__m128i const1 = _mm_set1_epi16(1);
+	__m128i constC = _mm_set_epi16(0, (short)cb, (short)cg, (short)cr, 0, (short)cb, (short)cg, (short)cr);
+
+	for (i = 0; i < count / 4; i++) {
+		//int a = nsvg__div255((int)cover[0] * ca);
+		__m128i cover_ca = _mm_mullo_epi16(_mm_unpacklo_epi8(_mm_cvtsi32_si128(*(const int*)cover), const0), _mm_set_epi16(0, 0, 0, 0, (short)ca, (short)ca, (short)ca, (short)ca));
+		//nsvg__div255:  (x + 1 + ((x + 1) >> 8)) >> 8
+		__m128i coverplusone = _mm_add_epi16(cover_ca, const1);
+		__m128i a = _mm_srli_epi16(_mm_add_epi16(coverplusone, _mm_srli_epi16(coverplusone, 8)), 8);
+		//int ia = 255 - a;
+		__m128i ia = _mm_sub_epi16(_mm_set_epi16(0, 0, 0, 0, 255, 255, 255, 255), a);
+
+		__m128i a_01 = _mm_set_epi16(a.m128i_u16[1], a.m128i_u16[1], a.m128i_u16[1], a.m128i_u16[1], a.m128i_u16[0], a.m128i_u16[0], a.m128i_u16[0], a.m128i_u16[0]);
+		__m128i ia_01 = _mm_set_epi16(ia.m128i_u16[1], ia.m128i_u16[1], ia.m128i_u16[1], ia.m128i_u16[1], ia.m128i_u16[0], ia.m128i_u16[0], ia.m128i_u16[0], ia.m128i_u16[0]);
+		__m128i a_23 = _mm_set_epi16(a.m128i_u16[3], a.m128i_u16[3], a.m128i_u16[3], a.m128i_u16[3], a.m128i_u16[2], a.m128i_u16[2], a.m128i_u16[2], a.m128i_u16[2]);
+		__m128i ia_23 = _mm_set_epi16(ia.m128i_u16[3], ia.m128i_u16[3], ia.m128i_u16[3], ia.m128i_u16[3], ia.m128i_u16[2], ia.m128i_u16[2], ia.m128i_u16[2], ia.m128i_u16[2]);
+
+		// Premultiply
+		//r = nsvg__div255(cr * a);
+		//g = nsvg__div255(cg * a);
+		//b = nsvg__div255(cb * a);
+		//nsvg__div255:  (x + 1 + ((x + 1) >> 8)) >> 8
+		__m128i rgbplusone_01 = _mm_add_epi16(_mm_mullo_epi16(constC, a_01), const1);
+		__m128i rgbout_01 = _mm_srli_epi16(_mm_add_epi16(rgbplusone_01, _mm_srli_epi16(rgbplusone_01, 8)), 8);
+		rgbout_01.m128i_u16[3] = a.m128i_u16[0];
+		rgbout_01.m128i_u16[7] = a.m128i_u16[1];
+		__m128i rgbplusone_23 = _mm_add_epi16(_mm_mullo_epi16(constC, a_23), const1);
+		__m128i rgbout_23 = _mm_srli_epi16(_mm_add_epi16(rgbplusone_23, _mm_srli_epi16(rgbplusone_23, 8)), 8);
+		rgbout_23.m128i_u16[3] = a.m128i_u16[2];
+		rgbout_23.m128i_u16[7] = a.m128i_u16[3];
+
+		// Blend over
+		//r += nsvg__div255(ia * (int)dst[0]);
+		//g += nsvg__div255(ia * (int)dst[1]);
+		//b += nsvg__div255(ia * (int)dst[2]);
+		//a += nsvg__div255(ia * (int)dst[3]);
+		__m128i dst16 = _mm_loadu_si128((__m128i*)dst);
+		__m128i dst_01 = _mm_unpacklo_epi8(dst16, const0);
+		__m128i dst_23 = _mm_unpackhi_epi8(dst16, const0);
+
+		//nsvg__div255:  (x + 1 + ((x + 1) >> 8)) >> 8
+		__m128i blendplusone_01 = _mm_add_epi16(_mm_mullo_epi16(ia_01, dst_01), const1);
+		__m128i blend16_01 = _mm_srli_epi16(_mm_add_epi16(blendplusone_01, _mm_srli_epi16(blendplusone_01, 8)), 8);
+		rgbout_01 = _mm_add_epi16(rgbout_01, blend16_01);
+		__m128i blendplusone_23 = _mm_add_epi16(_mm_mullo_epi16(ia_23, dst_23), const1);
+		__m128i blend16_23 = _mm_srli_epi16(_mm_add_epi16(blendplusone_23, _mm_srli_epi16(blendplusone_23, 8)), 8);
+		rgbout_23 = _mm_add_epi16(rgbout_23, blend16_23);
+
+		//dst[0] = (unsigned char)r;
+		//dst[1] = (unsigned char)g;
+		//dst[2] = (unsigned char)b;
+		//dst[3] = (unsigned char)a;
+		__m128i out = _mm_packus_epi16(rgbout_01, rgbout_23);
+		_mm_storeu_si128((__m128i*)dst, out);
+
+		cover += 4;
+		dst += 16;
+	}
+	for (i = 4 * (count / 4); i < count; i++) {
+		int r, g, b;
+
+		int a = nsvg__div255((int)cover[0] * ca);
+		int ia = 255 - a;
+
+		// Premultiply
+		r = nsvg__div255(cr * a);
+		g = nsvg__div255(cg * a);
+		b = nsvg__div255(cb * a);
+
+		// Blend over
+		r += nsvg__div255(ia * (int)dst[0]);
+		g += nsvg__div255(ia * (int)dst[1]);
+		b += nsvg__div255(ia * (int)dst[2]);
+		a += nsvg__div255(ia * (int)dst[3]);
+
+		dst[0] = (unsigned char)r;
+		dst[1] = (unsigned char)g;
+		dst[2] = (unsigned char)b;
+		dst[3] = (unsigned char)a;
+
+		cover++;
+		dst += 4;
+	}
+#else // NSVG_USESSE2
 		int i, cr, cg, cb, ca;
 		cr = cache->colors[0] & 0xff;
 		cg = (cache->colors[0] >> 8) & 0xff;
@@ -898,6 +992,7 @@ static void nsvg__scanlineSolid(unsigned char* dst, int count, unsigned char* co
 			cover++;
 			dst += 4;
 		}
+#endif // NSVG_USESSE2
 	} else if (cache->type == NSVG_PAINT_LINEAR_GRADIENT) {
 		// TODO: spread modes.
 		// TODO: plenty of opportunities to optimize.
